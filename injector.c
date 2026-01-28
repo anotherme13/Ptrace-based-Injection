@@ -4,9 +4,11 @@
 #include <stdlib.h>
 #include <sys/wait.h>
 #include <sys/user.h>
+#include <sys/mman.h>
 #include <string.h>
 #include <dlfcn.h>
 #include <sys/mman.h>
+
 unsigned long long find_libc_base(pid_t pid)
 {
     char maps_path[256];
@@ -46,7 +48,6 @@ unsigned long long find_function_offset(const char *func_name)
         perror("dlopen libc");
         return 0;
     }
-
     
     unsigned long func_addr = (unsigned long)dlsym(libc, func_name);
     Dl_info info;
@@ -57,6 +58,7 @@ unsigned long long find_function_offset(const char *func_name)
     return func_addr - libc_base;
 
 }
+
 
 int main(int argc, char *argv[])
 {
@@ -112,31 +114,25 @@ int main(int argc, char *argv[])
 
 
     // Ok, finish finding addresses, now do the injection
+    printf("[*] Original RSP: 0x%lx\n", regs.rsp);
+   
+    // ABI x86-64 needs alignment of stack to 16 bytes before a call -> & ~0xFULL
+    // btw we are at a random instruction, at a random stack state, so
+    // we need to subtract a safe space, i choose 8192 bytes
 
-    unsigned long orig_rsp = regs.rsp;
-    printf("[*] Original RSP: 0x%lx\n", orig_rsp);
-    unsigned long sentinel = 0xdeadbeefdeadbeef;
-    
-    regs.rsp -= 8;
-    unsigned long return_addr = regs.rsp;
-    
-    if (ptrace(PTRACE_POKETEXT, target, return_addr, sentinel) == -1)
+    regs.rsp = (regs.rsp - 8192) & ~0xFULL;
+
+    // i need to know where to return after mmap call
+    // so i will set a breakpoint (int3) at top of the stack, before calling mmap
+    unsigned long long return_addr = regs.rsp;
+    if (ptrace(PTRACE_POKETEXT, target, return_addr, 0xCC) == -1)
     {
         perror("ptrace poketext");
         ptrace(PTRACE_DETACH, target, NULL, NULL);
         return 1;
     }
-    
-    regs.rsp -= 8;
-    return_addr = regs.rsp;
-    if (ptrace(PTRACE_POKETEXT, target, return_addr, sentinel) == -1)
-    {
-        perror("ptrace poketext");
-        ptrace(PTRACE_DETACH, target, NULL, NULL);
-        return 1;
-    }
-    // ABI x86-64 needs alignment of stack to 16 bytes before a call, hence we need do it one more time!
-    
+
+    // Set up mmap parameters in registers
     regs.rdi = 0;
     regs.rsi = 0x1000;
     regs.rdx = PROT_READ | PROT_WRITE;
@@ -144,7 +140,7 @@ int main(int argc, char *argv[])
     regs.r8 = -1;
     regs.r9 = 0;
     regs.rip = mmap_addr;
-
+    
     if (ptrace(PTRACE_SETREGS, target, NULL, &regs) == -1)
     {
         perror("ptrace setregs");
@@ -159,50 +155,19 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    for (int i = 0; i < 10000; i++)
+    waitpid(target, &status, 0);
+    printf("[*] mmap call completed\n");
+
+    if (WIFSTOPPED(status) && WSTOPSIG(status) != SIGTRAP)
     {
-        if (ptrace(PTRACE_SINGLESTEP, target, NULL, NULL) == -1)
-        {
-            perror("ptrace singlestep");
-            ptrace(PTRACE_DETACH, target, NULL, NULL);
-            return 1;
-        }
-        waitpid(target, &status, 0);
-
-        if (ptrace(PTRACE_GETREGS, target, NULL, &regs) == -1)
-        {
-            perror("ptrace getregs");
-            ptrace(PTRACE_DETACH, target, NULL, NULL);
-            return 1;
-        }
-
-        if (regs.rip == return_addr)            break;
-
-        if (WIFSIGNALED(status))
-        {
-            perror("target process crashed");
-            ptrace(PTRACE_DETACH, target, NULL, NULL);
-            return 1;   
-        }
-
-        if (WIFEXITED(status))
-        {
-            perror("target process exited");
-            ptrace(PTRACE_DETACH, target, NULL, NULL);
-            return 1;
-        }
-    }
-
-    if (ptrace(PTRACE_GETREGS, target, NULL, &regs) == -1)
-    {
-        perror("ptrace getregs");
+        fprintf(stderr, "[-] Target did not hit breakpoint as expected\n");
         ptrace(PTRACE_DETACH, target, NULL, NULL);
         return 1;
     }
 
-    unsigned long long allocated_mem = regs.rax;
+    // let's restore
+    ptrace(PTRACE_POKETEXT, target, return_)
 
-    printf("[+] allocated memory at: 0x%llx\n", allocated_mem);
 
 
 
