@@ -166,7 +166,7 @@ int main(int argc, char *argv[])
     }
 
     // let's restore
-    ptrace(PTRACE_POKETEXT, target, return_)
+    ptrace(PTRACE_POKETEXT, target, return_addr, orig_regs.rip);
 
 
 
