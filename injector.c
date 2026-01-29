@@ -56,7 +56,37 @@ unsigned long long find_function_offset(const char *func_name)
 
     dlclose(libc);
     return func_addr - libc_base;
+}
 
+int check_memory_writeable(pid_t pid, unsigned long long addr)
+{
+    char maps_path[256];
+    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+
+    FILE *fp = fopen(maps_path, "r");
+    if (!fp)
+    {
+        perror("fopen /proc/self/maps");
+        return 0;
+    }
+
+    char line[256], perms[5];
+    while (fgets(line, sizeof(line), fp))
+    {
+        unsigned start, end;
+        if (sscanf(line,"%llx-%llx %s", &start, &end, perms) >= 3)
+        {
+            if (start <= addr && addr <= end)
+            {
+                printf("[*] Ok, found the segment for address)\n");
+                fclose(fp);
+                return (strchr(perms, 'w') != NULL);
+            }
+        }
+    }
+    printf("[-] Fail! Cannot find segment for address!\n");
+    fclose(fp);
+    return 0;
 }
 
 
@@ -114,7 +144,7 @@ int main(int argc, char *argv[])
 
 
     // Ok, finish finding addresses, now do the injection
-    printf("[*] Original RSP: 0x%lx\n", regs.rsp);
+    printf("[*] Original RSP: 0x%llx\n", regs.rsp);
    
     // ABI x86-64 needs alignment of stack to 16 bytes before a call -> & ~0xFULL
     // btw we are at a random instruction, at a random stack state, so
@@ -125,6 +155,7 @@ int main(int argc, char *argv[])
     // i need to know where to return after mmap call
     // so i will set a breakpoint (int3) at top of the stack, before calling mmap
     unsigned long long return_addr = regs.rsp;
+    
     if (ptrace(PTRACE_POKETEXT, target, return_addr, 0xCC) == -1)
     {
         perror("ptrace poketext");
@@ -158,15 +189,27 @@ int main(int argc, char *argv[])
     waitpid(target, &status, 0);
     printf("[*] mmap call completed\n");
 
-    if (WIFSTOPPED(status) && WSTOPSIG(status) != SIGTRAP)
-    {
-        fprintf(stderr, "[-] Target did not hit breakpoint as expected\n");
-        ptrace(PTRACE_DETACH, target, NULL, NULL);
-        return 1;
-    }
-
-    // let's restore
-    ptrace(PTRACE_POKETEXT, target, return_addr, orig_regs.rip);
+    // actually I don't know why, but maybe mmap itself triggers a SIGSTOP, 
+    // so I have to pass all signals until I hit my breakpoint
+    while (1)
+        if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP)
+        {
+            // just continue
+            ptrace(PTRACE_CONT, target, NULL, NULL);
+            waitpid(target, &status, 0);
+        }
+        else
+        if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP)
+        {
+            printf("[*] hit my breakpoint after mmap\n");
+            break;
+        }
+        else
+        {
+            printf("[*] another signal %d caught: ", WSTOPSIG(status));
+        }
+    // // let's restore
+    // ptrace(PTRACE_POKETEXT, target, return_addr, orig_regs.rip);
 
 
 
