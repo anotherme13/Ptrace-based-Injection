@@ -1,35 +1,39 @@
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <string.h>
-
-void notifier()
-{
-    printf("Notifier called!\n");
-}
+#include <dlfcn.h>
+#include <unistd.h>
 
 int main()
 {
-    char input[256];
-    while (1) {
-        printf("Type 'r' to read doc.txt, 'q' to quit: ");
-        if (!fgets(input, sizeof(input), stdin)) break;
-        // Remove trailing newline
-        input[strcspn(input, "\n")] = 0;
-        if (input[0] == 'q') {
-            break;
-        } else if (input[0] == 'r') {
-            FILE* f = fopen("doc.txt", "r");
-            if (!f) {
-                printf("Failed to open doc.txt\n");
-                continue;
-            }
-            printf("-------doc.txt-----\n");
-            char file_line[1024];
-            while (fgets(file_line, sizeof(file_line), f)) {
-                printf("%s\n", file_line);
-            }
-            fclose(f);
-        }
+    void *libc = dlopen("libc.so.6", RTLD_LAZY);
+    if (!libc)
+    {
+        perror("dlopen libc");
+        return 1;
+    }
+    
+    // Get mmap address
+    void *mmap_ptr = dlsym(libc, "mmap");
+    printf("mmap address from dlsym: %p\n", mmap_ptr);
+    
+    // Get info about where it actually points
+    Dl_info info;
+    if (dladdr(mmap_ptr, &info))
+    {
+        printf("Symbol name: %s\n", info.dli_sname);
+        printf("Library base: %p\n", info.dli_fbase);
+        printf("Symbol address: %p\n", info.dli_saddr);
+        printf("Offset from base: 0x%lx\n", 
+               (unsigned long)mmap_ptr - (unsigned long)info.dli_fbase);
+    }
+
+    dlclose(libc);
+
+    while(1)
+    {
+        sleep(1);
     }
     return 0;
 }

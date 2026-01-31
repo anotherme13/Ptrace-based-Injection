@@ -28,7 +28,7 @@ unsigned long long find_libc_base(pid_t pid)
     {
         unsigned long start, end;
         sscanf(line, "%lx-%lx %s %*s %*s %*s %s", &start, &end, perms, pathname);
-        if (strstr(pathname, "libc.so") && strchr(perms, 'x'))
+        if (strstr(pathname, "libc.so"))
         {
             libc_base = start;
             printf("libc base address: 0x%llx\n", libc_base);
@@ -73,7 +73,7 @@ int check_memory_writeable(pid_t pid, unsigned long long addr)
     char line[256], perms[5];
     while (fgets(line, sizeof(line), fp))
     {
-        unsigned start, end;
+        unsigned long long start, end;
         if (sscanf(line,"%llx-%llx %s", &start, &end, perms) >= 3)
         {
             if (start <= addr && addr <= end)
@@ -101,8 +101,6 @@ int main(int argc, char *argv[])
     pid_t target = atoi(argv[1]);
     const char *lib_path = argv[2];
     size_t lib_len = strlen(lib_path) + 1;
-    
-
 
     if (ptrace(PTRACE_ATTACH, target, NULL, NULL) == -1)
     {
@@ -123,7 +121,6 @@ int main(int argc, char *argv[])
     }
 
     memcpy(&orig_regs, &regs, sizeof(regs));
-    printf("[*] Original RIP: 0x%llx\n", regs.rip);
 
     // find libc base address
     unsigned long long target_libc_base = find_libc_base(target);
@@ -143,22 +140,24 @@ int main(int argc, char *argv[])
     printf("target dlopen address: 0x%llx\n", dlopen_addr);
 
 
-    // Ok, finish finding addresses, now do the injection
-    printf("[*] Original RSP: 0x%llx\n", regs.rsp);
+    printf("[*] Original RIP: 0x%llx\n", regs.rip);
+ 
    
-    // ABI x86-64 needs alignment of stack to 16 bytes before a call -> & ~0xFULL
-    // btw we are at a random instruction, at a random stack state, so
-    // we need to subtract a safe space, i choose 8192 bytes
-
-    regs.rsp = (regs.rsp - 8192) & ~0xFULL;
-
-    // i need to know where to return after mmap call
-    // so i will set a breakpoint (int3) at top of the stack, before calling mmap
-    unsigned long long return_addr = regs.rsp;
+    // ABI x86-64: RSP must be 16-byte aligned BEFORE call instruction
+    regs.rsp = (regs.rsp - 128) & ~0xFULL; 
     
-    if (ptrace(PTRACE_POKETEXT, target, return_addr, 0xCC) == -1)
-    {
-        perror("ptrace poketext");
+
+    // Save the return address (original RIP) BEFORE we change it
+    unsigned long long return_addr = regs.rip;
+    long orig_instruction = ptrace(PTRACE_PEEKTEXT, target, return_addr, NULL);
+    long breakpoint_instruction = (orig_instruction & ~0xFF) | 0xCC;
+    ptrace(PTRACE_POKETEXT, target, return_addr, breakpoint_instruction);
+    
+
+    // Push return address onto the stack 
+    regs.rsp -= 8;  
+    if (ptrace(PTRACE_POKETEXT, target, regs.rsp, return_addr) == -1) {
+        perror("ptrace poketext (push return addr)");
         ptrace(PTRACE_DETACH, target, NULL, NULL);
         return 1;
     }
@@ -167,11 +166,12 @@ int main(int argc, char *argv[])
     regs.rdi = 0;
     regs.rsi = 0x1000;
     regs.rdx = PROT_READ | PROT_WRITE;
-    regs.r10 = MAP_PRIVATE | MAP_ANONYMOUS;
+    regs.rcx = MAP_PRIVATE | MAP_ANONYMOUS;
     regs.r8 = -1;
     regs.r9 = 0;
     regs.rip = mmap_addr;
     
+    printf("[*] Set up registers for mmap call\n");
     if (ptrace(PTRACE_SETREGS, target, NULL, &regs) == -1)
     {
         perror("ptrace setregs");
@@ -179,39 +179,107 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (ptrace(PTRACE_CONT, target, NULL, NULL) == -1)
+    int loop_count = 0;
+    while (1)
     {
-        perror("ptrace cont");
+        ptrace(PTRACE_CONT, target, NULL, NULL);
+        waitpid(target, &status, 0);
+        ptrace(PTRACE_GETREGS, target, NULL, &regs);
+       
+        if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP)
+        {
+            printf("[*] hit my breakpoint after mmap\n");
+            printf("[*] mmap returned: 0x%llx\n", regs.rax);
+            break;
+        }
+    }
+
+        
+    // Restore the original instruction
+    ptrace(PTRACE_POKETEXT, target, return_addr, orig_instruction);
+
+
+
+    // NOW FOR DLOPEN CALL, I do the same steps again
+
+
+    memcpy(&orig_regs, &regs, sizeof(regs));
+    regs.rsp = (regs.rsp - 128) & ~0xFULL; 
+
+    return_addr = regs.rip;
+    orig_instruction = ptrace(PTRACE_PEEKTEXT, target, return_addr, NULL);
+    breakpoint_instruction = (orig_instruction & ~0xFF) | 0xCC;
+    ptrace(PTRACE_POKETEXT, target, return_addr, breakpoint_instruction);
+    
+
+    regs.rsp -= 8;  
+    if (ptrace(PTRACE_POKETEXT, target, regs.rsp, return_addr) == -1) {
+        perror("ptrace poketext (push return addr)");
         ptrace(PTRACE_DETACH, target, NULL, NULL);
         return 1;
     }
 
-    waitpid(target, &status, 0);
-    printf("[*] mmap call completed\n");
+    // Save the mmap result (allocated memory address)
+    unsigned long long mmap_mem = regs.rax;
 
-    // actually I don't know why, but maybe mmap itself triggers a SIGSTOP, 
-    // so I have to pass all signals until I hit my breakpoint
-    while (1)
-        if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP)
+    // Write library path to the mmap'd memory
+    printf("[*] Writing library path to 0x%llx\n", mmap_mem);
+    for (size_t i = 0; i < lib_len; i += sizeof(long))
+    {
+        long word = 0;
+        size_t chunk = (lib_len - i < sizeof(long)) ? (lib_len - i) : sizeof(long);
+        memcpy(&word, lib_path + i, chunk);
+        
+        if (ptrace(PTRACE_POKETEXT, target, mmap_mem + i, word) == -1)
         {
-            // just continue
-            ptrace(PTRACE_CONT, target, NULL, NULL);
-            waitpid(target, &status, 0);
+            perror("ptrace poketext (write lib path)");
+            ptrace(PTRACE_DETACH, target, NULL, NULL);
+            return 1;
         }
-        else
+    }
+    printf("[+] Wrote library path: %s\n", lib_path);
+
+
+    regs.rdi = mmap_mem;    // pointer to library path string
+    regs.rsi = RTLD_NOW;   
+    regs.rip = dlopen_addr;
+    
+    printf("[*] Set up registers for dlopen call\n");
+    if (ptrace(PTRACE_SETREGS, target, NULL, &regs) == -1)
+    {
+        perror("ptrace setregs");
+        ptrace(PTRACE_DETACH, target, NULL, NULL);
+        return 1;
+    }
+
+    // Wait for dlopen to complete
+    while (1)
+    {
+        ptrace(PTRACE_CONT, target, NULL, NULL);
+        waitpid(target, &status, 0);
+        ptrace(PTRACE_GETREGS, target, NULL, &regs);
+       
         if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP)
         {
-            printf("[*] hit my breakpoint after mmap\n");
+            printf("[*] hit my breakpoint after dlopen\n");
+            printf("[*] dlopen returned: 0x%llx\n", regs.rax);
             break;
         }
-        else
-        {
-            printf("[*] another signal %d caught: ", WSTOPSIG(status));
-        }
-    // // let's restore
-    // ptrace(PTRACE_POKETEXT, target, return_addr, orig_regs.rip);
+    }
+        
+    // Restore the original instruction
+    ptrace(PTRACE_POKETEXT, target, return_addr, orig_instruction);
 
+    // Restore original registers
+    if (ptrace(PTRACE_SETREGS, target, NULL, &orig_regs) == -1)
+    {
+        perror("ptrace setregs restore");
+    }
+    
+    // Detach from target
+    ptrace(PTRACE_DETACH, target, NULL, NULL);
+    printf("[+] Detached from process %d\n", target);
+    printf("[+] Injection %s!\n", regs.rax ? "COMPLETE" : "FAILED");
 
-
-
+    return regs.rax ? 0 : 1;
 }
