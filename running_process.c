@@ -33,7 +33,8 @@ int main()
 
     while(1)
     {
-        sleep(1);
+       int a = 1;
+       // do something here
     }
     return 0;
 }
