@@ -14,7 +14,7 @@
 | File | Description |
 |------|-------------|
 | `injector.c` | Attaches to target, allocates memory, injects library |
-| `hook.c` | Payload library that hooks `fopen()` |
+| `hook.c` | Payload library that hooks `fopen()` (for example) |
 | `running_process.c` | Test target process |
 
 ## 🛠️ Build & Run
